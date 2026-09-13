@@ -61,6 +61,12 @@ npx @deepseek-ai/dsh --profile headless "检查这个仓库"
 
 模型列表来自当前登录的 Codex 账户，插件不会把 GPT 版本写死在代码中。
 
+## 工具权限
+
+文件写入和审批由 Harness 按当前会话权限执行。底层会话通过 `environments: []` 关闭 Codex 原生环境访问，移除 `apply_patch` 等原生文件工具，避免仅靠提示语要求模型不用它们。插件保留 Codex 原生工具的只读隔离；这不限制由 Harness 执行的动态工具。插件会在开发者指令中明确区分这两层权限，模型应根据 Harness 工具实际返回的成功、拒绝或审批要求继续工作，不能仅凭 Codex 的只读提示要求切换工作区。
+
+升级后需要重新加载插件，使新建的底层 Codex 会话收到这段说明；已运行的会话不会自动更新。
+
 ## 干净卸载
 
 下面的命令会删除所有当前 Harness profiles 中的插件注册，但保留 ChatGPT 登录，方便以后重新安装：
@@ -76,6 +82,14 @@ npx -y dsh-openai-oauth uninstall --purge-auth
 ```
 
 这两条命令也会清理旧包名留下的注册。插件通过 `npx` 运行，不会在系统中留下一个长期安装的全局 npm 包。npm 自身仍可能保留普通下载缓存。
+
+可手动运行真实 Harness 端到端验证：
+
+```sh
+DSH_CLI=/absolute/path/to/dsh/lib/bin.js node scripts/harness-permission-smoke.mjs
+```
+
+该验证使用现有插件 ChatGPT 登录，在隔离的 Harness 数据目录与工作区中分别运行完全访问、只读策略，通过真实 `edit` 和 `read` 工具验证文件内容与持久化调用结果，结束后清理临时数据。可用 `DSH_SMOKE_PROVIDER` 指向已安装插件的入口，验证实际安装版本。
 
 ## 本地开发
 

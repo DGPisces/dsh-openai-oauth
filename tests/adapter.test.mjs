@@ -15,7 +15,7 @@ class FakeServer {
       supportedReasoningEfforts: [{ reasoningEffort: 'high', description: 'High' }],
     }]
   }
-  async startThread() { return 'thread-1' }
+  async startThread(input) { this.threadInput = input; return 'thread-1' }
   async startTurn(_threadId, input) {
     this.turnInput = input.input[0].text
     this.events.push({
@@ -63,6 +63,11 @@ test('bridges a Codex dynamic tool call across two Harness model steps', async (
     ],
   }))
   assert.equal(server.turnInput, 'ping\n\nruntime context')
+  assert.equal(server.threadInput.sandbox, 'read-only')
+  assert.deepEqual(server.threadInput.environments, [])
+  assert.equal(server.threadInput.approvalPolicy, 'never')
+  assert.match(server.threadInput.developerInstructions, /outside the Codex native-tool sandbox/)
+  assert.match(server.threadInput.developerInstructions, /including denials and approval requirements/)
   assert.deepEqual(first.at(-1).reason, { kind: 'tool-calls' })
   assert.equal(first.find(chunk => chunk.type === 'block-end').block.id, 'call-1')
 
@@ -77,6 +82,25 @@ test('bridges a Codex dynamic tool call across two Harness model steps', async (
   assert.equal(server.responses[0].result.contentItems[0].text, 'pong-from-harness')
   assert.equal(second.find(chunk => chunk.type === 'block-end').block.text, 'pong')
   assert.deepEqual(second.at(-1).reason, { kind: 'stop' })
+})
+
+test('preserves a Harness permission denial when returning a dynamic tool result', async () => {
+  const server = new FakeServer()
+  const adapter = new CodexAppServerAdapter(server)
+  await Array.fromAsync(adapter.stream({
+    ...base,
+    messages: [{ id: 'u1', role: 'user', content: [{ type: 'text', text: 'write' }] }],
+  }))
+  await Array.fromAsync(adapter.stream({
+    ...base,
+    messages: [{ role: 'user', content: [{
+      type: 'tool-result', toolCallId: 'call-1', isError: true,
+      content: [{ type: 'text', text: 'Harness denied write: current file policy is read-only.' }],
+    }] }],
+  }))
+  assert.equal(server.responses[0].result.success, false)
+  assert.equal(server.responses[0].result.contentItems[0].text,
+    'Harness denied write: current file policy is read-only.')
 })
 
 test('discovers models from Codex instead of hardcoding GPT versions', async () => {

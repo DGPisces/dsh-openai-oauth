@@ -77,6 +77,20 @@ npx -y dsh-openai-oauth uninstall --purge-auth
 
 These commands also remove registrations left by the old package name. They do not install a permanent global npm package. npm may retain its normal download cache.
 
+## Tool permissions
+
+Harness enforces file access and approvals for its dynamic tools. Threads use `environments: []` to disable Codex environment access, removing native file tools such as `apply_patch` instead of relying only on instructions to avoid them. Codex native tools remain in a read-only sandbox; that sandbox does not constrain tools executed by Harness. The adapter explains this boundary in developer instructions so the model follows actual Harness success, denial, or approval results instead of asking users to switch workspaces based on Codex metadata.
+
+Reload the plugin after upgrading so newly created Codex sessions receive the instructions. Already running sessions are not updated automatically.
+
+For an opt-in end-to-end check against an installed Harness runtime, run:
+
+```sh
+DSH_CLI=/absolute/path/to/dsh/lib/bin.js node scripts/harness-permission-smoke.mjs
+```
+
+This creates isolated Harness homes and workspaces, exercises real `edit` and `read` tools with full-access and read-only policies, checks the durable tool results and file contents, and cleans up the temporary data. It uses the existing plugin ChatGPT login. Set `DSH_SMOKE_PROVIDER` to an installed adapter entry point to verify that installation.
+
 ## Local development
 
 ```sh
