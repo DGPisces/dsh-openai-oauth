@@ -1,7 +1,7 @@
 {
   "name": "dsh-openai-oauth",
-  "version": "0.4.0",
-  "description": "DeepSeek Harness LLM provider for Codex models using managed ChatGPT OAuth",
+  "version": "0.7.0",
+  "description": "Sign in with ChatGPT for DeepSeek Harness: OAuth sign-in only, with inference, sessions and model catalog served by the harness provider route",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -18,8 +18,7 @@
   },
   "bin": {
     "dsh-openai-oauth": "lib/global.js",
-    "dsh-codex": "lib/global.js",
-    "dsh-codex-login": "lib/login.js"
+    "dsh-codex": "lib/global.js"
   },
   "files": [
     "lib",
@@ -38,8 +37,8 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-settings"
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots"
       ],
       "platform": "web"
     }
@@ -51,27 +50,28 @@
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
-    "codex",
+    "chatgpt",
+    "siwc",
     "oauth"
   ],
   "license": "MIT",
   "dependencies": {
-    "@openai/codex": "0.146.0"
+    "@deepseek-ai/schemastery": "~3.19.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-host-webserver": ">=0.1.0-rc.5",
-    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.5",
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-credentials": ">=0.2.2-rc.5",
+    "@deepseek-ai/dsh-host-webserver": ">=0.2.2-rc.5",
     "react": "^18.2.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
       "optional": true
     },
-    "@deepseek-ai/dsh-host-webserver": {
+    "@deepseek-ai/dsh-credentials": {
       "optional": true
     },
-    "@deepseek-ai/dsh-llm": {
+    "@deepseek-ai/dsh-host-webserver": {
       "optional": true
     },
     "react": {
@@ -79,15 +79,20 @@
     }
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "4.0.1",
-    "@deepseek-ai/dsh-client-runtime": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-client-ui-settings": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-client-ui-slots": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-host-webserver": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-attachment": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-layout": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-host-webserver": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.5",
+    "@deepseek-ai/schemastery": "~3.19.0",
     "@types/node": "^24.3.0",
     "@types/react": "^18.3.24",
     "react": "^18.3.1",
+    "react-test-renderer": "^18.3.1",
     "tsdown": "^0.22.2",
     "typescript": "^5.9.2"
   },
