@@ -371,6 +371,63 @@ test('ambiguous network failure or invalid rotated identity cannot retry old ref
   }
 })
 
+test('an undelivered refresh request restores the grant so a later tick can retry', async () => {
+  const store = memoryStore(state(account()))
+  let online = false
+  const auth = new SiwcAuth({ store, appName: SIWC_AGENT_NAME, now: () => now, fetch: mockFetch(async () => {
+    if (!online) throw new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo ENOTFOUND auth.openai.com'), { code: 'ENOTFOUND' }) })
+    return json(response(jwt({ sub: 'subject-1' })))
+  }) })
+  await assert.rejects(auth.accessToken('oaiapp_test'), error => error instanceof SiwcOAuthError && error.undelivered && !error.uncertain && !error.reauthorizationRequired)
+  const saved = (await store.read()).accounts[0]
+  assert.equal(saved.accessToken, 'access-old')
+  assert.equal(saved.refreshToken, 'refresh-old')
+  assert.equal(saved.quarantined, undefined)
+  assert.equal(saved.refreshPending, undefined)
+  assert.equal(saved.revocationUnconfirmed, undefined)
+  online = true
+  assert.equal(await auth.accessToken('oaiapp_test'), 'access-new')
+  const retried = (await store.read()).accounts[0]
+  assert.equal(retried.refreshToken, 'refresh-new')
+  assert.equal(retried.quarantined, undefined)
+})
+
+test('a connect failure that never sent the request is not a quarantine', async () => {
+  for (const code of ['ECONNREFUSED', 'ENETUNREACH', 'EAI_AGAIN']) {
+    const store = memoryStore(state(account()))
+    const auth = new SiwcAuth({ store, appName: SIWC_AGENT_NAME, now: () => now, fetch: mockFetch(async () => {
+      throw new TypeError('fetch failed', { cause: Object.assign(new Error('offline'), { code }) })
+    }) })
+    await assert.rejects(auth.accessToken('oaiapp_test'), error => error.undelivered && !error.uncertain)
+    assert.equal((await store.read()).accounts[0].refreshToken, 'refresh-old')
+  }
+})
+
+test('a timed-out refresh stays ambiguous and quarantines the grant', async () => {
+  const store = memoryStore(state(account()))
+  const auth = new SiwcAuth({ store, appName: SIWC_AGENT_NAME, now: () => now, fetch: mockFetch(async () => {
+    throw new TypeError('fetch failed', { cause: Object.assign(new Error('timed out'), { name: 'TimeoutError', code: 'UND_ERR_HEADERS_TIMEOUT' }) })
+  }) })
+  await assert.rejects(auth.accessToken('oaiapp_test'), error => error instanceof SiwcOAuthError && error.uncertain && !error.undelivered)
+  const saved = (await store.read()).accounts[0]
+  assert.equal(saved.refreshToken, undefined)
+  assert.equal(saved.quarantined.refreshToken, 'refresh-old')
+})
+
+test('an undelivered sign-in exchange reports no unknown remote session', async () => {
+  const store = memoryStore()
+  const auth = new SiwcAuth({ store, appName: SIWC_AGENT_NAME, now: () => now, fetch: mockFetch(async () => {
+    throw new TypeError('fetch failed', { cause: Object.assign(new Error('offline'), { code: 'ENOTFOUND' }) })
+  }) })
+  const attempt = await auth.startSignIn()
+  const params = (await authorize(attempt)).searchParams
+  await callback(attempt, { state: params.get('state'), code: 'code', client_id: 'oaiapp_test' })
+  await assert.rejects(attempt.result, error => error instanceof SiwcOAuthError && error.undelivered)
+  const pending = (await store.read()).pendingRegistration
+  assert.equal(pending.revocationUnconfirmed, undefined)
+  assert.deepEqual(pending.quarantinedRefreshTokens, [])
+})
+
 test('durable refresh tombstone prevents old-token reuse when final commit fails', async () => {
   const base = memoryStore(state(account()))
   let writes = 0

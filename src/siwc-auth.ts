@@ -99,10 +99,12 @@ export class SiwcOAuthError extends Error {
   readonly reauthorizationRequired: boolean
   /** True means the protected credentials are quarantined; automatic refresh must not be retried. */
   readonly uncertain: boolean
-  constructor(status: number | undefined, code: string | undefined, operation: 'token' | 'authorization' | 'refresh', reauthorizationRequired = false, uncertain = false) {
-    super(`SIWC: ${operation} ${reauthorizationRequired ? 'requires reauthorization' : uncertain ? 'outcome uncertain; credentials quarantined' : 'failed'}${status ? ` (${status})` : ''}${code ? `: ${code}` : ''}`)
+  /** True proves the request never reached the issuer (offline resolution or connect failure). */
+  readonly undelivered: boolean
+  constructor(status: number | undefined, code: string | undefined, operation: 'token' | 'authorization' | 'refresh', reauthorizationRequired = false, uncertain = false, undelivered = false) {
+    super(`SIWC: ${operation} ${reauthorizationRequired ? 'requires reauthorization' : uncertain ? 'outcome uncertain; credentials quarantined' : undelivered ? 'request was not delivered; a retry is safe' : 'failed'}${status ? ` (${status})` : ''}${code ? `: ${code}` : ''}`)
     this.name = 'SiwcOAuthError'
-    this.status = status; this.code = code; this.operation = operation; this.reauthorizationRequired = reauthorizationRequired; this.uncertain = uncertain
+    this.status = status; this.code = code; this.operation = operation; this.reauthorizationRequired = reauthorizationRequired; this.uncertain = uncertain; this.undelivered = undelivered
   }
 }
 
@@ -203,10 +205,24 @@ function tokens(body: Record<string, unknown>, now: number, previousScopes?: str
 }
 const OAUTH_ERRORS = new Set(['invalid_grant', 'invalid_refresh_token', 'token_expired', 'refresh_token_expired', 'refresh_token_invalidated', 'refresh_token_reused', 'invalid_client', 'access_denied', 'temporarily_unavailable', 'server_error'])
 function oauthCode(value: unknown): string | undefined { return typeof value === 'string' && OAUTH_ERRORS.has(value) ? value : undefined }
+/** Resolution or connect failures that prove no byte of the request reached the issuer.
+ * A timeout, an abort, or any response — including an error response — stays ambiguous,
+ * because the issuer may already have rotated the refresh token. */
+const UNDELIVERED_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EADDRNOTAVAIL'])
+function undelivered(error: unknown): boolean {
+  let value: unknown = error
+  for (let depth = 0; depth < 5 && value && typeof value === 'object'; depth++) {
+    const item = value as { name?: unknown; code?: unknown; cause?: unknown }
+    if (item.name === 'TimeoutError' || item.name === 'AbortError') return false
+    if (typeof item.code === 'string' && UNDELIVERED_CODES.has(item.code)) return true
+    value = item.cause
+  }
+  return false
+}
 async function post(fetcher: Fetch, endpoint: string, data: URLSearchParams): Promise<Record<string, unknown>> {
   let response: Response
   try { response = await fetcher(endpoint, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' }, body: data, redirect: 'error', signal: AbortSignal.timeout(10_000) }) }
-  catch { throw new SiwcOAuthError(undefined, undefined, 'token') }
+  catch (error) { throw new SiwcOAuthError(undefined, undefined, 'token', false, false, undelivered(error)) }
   let value: unknown
   try { value = await response.json() } catch { if (!response.ok) throw new SiwcOAuthError(response.status, undefined, 'token'); return fail('invalid endpoint response') }
   if (!response.ok) throw new SiwcOAuthError(response.status, oauthCode((value as Record<string, unknown> | null)?.error), 'token')
@@ -484,8 +500,9 @@ export class SiwcAuth {
       const exchangeRejected = !rawRefresh && error instanceof SiwcOAuthError && !!error.status && error.status >= 400 && error.status < 500 && !!error.code && ['invalid_grant', 'invalid_client'].includes(error.code)
       const revoked = rawRefresh ? await this.revoke(rawRefresh, clientId) : exchangeRejected || identityOnly
       // A known refresh token can be retried for revocation; only an outcome
-      // without a known token represents an irrecoverably unknown session.
-      const unknownSession = !revoked && !rawRefresh
+      // without a known token represents an irrecoverably unknown session. An
+      // undelivered exchange never created a session, so it stays unknown-free.
+      const unknownSession = !revoked && !rawRefresh && !(error instanceof SiwcOAuthError && error.undelivered)
       if (!selected) {
         try { await this.options.store.modify(async current => {
           if (!current || current.hostId !== hostId) return undefined
@@ -581,9 +598,12 @@ export class SiwcAuth {
           // Only terminal refresh codes delete the grant. Other outcomes quarantine it:
           // even a 5xx can arrive after rotation, so it must never be retried blindly.
           const terminal = !!oauth?.code && ['invalid_grant', 'invalid_refresh_token', 'token_expired', 'refresh_token_expired', 'refresh_token_invalidated', 'refresh_token_reused'].includes(oauth.code)
-          failure = new SiwcOAuthError(oauth?.status, oauth?.code, 'refresh', terminal, !terminal)
+          // A request that provably never left this machine cannot have rotated the
+          // refresh token, so the pre-refresh grant is restored instead of quarantined.
+          const restore = oauth?.undelivered === true ? original : undefined
+          failure = restore ? new SiwcOAuthError(undefined, oauth?.code, 'refresh', false, false, true) : new SiwcOAuthError(oauth?.status, oauth?.code, 'refresh', terminal, !terminal)
           const preserved = replacement ? { ...replacement, reason: 'replacement_unverified' } : rawRefresh ? { refreshToken: rawRefresh, scopes: [], reason: 'replacement_unverified' } : account.quarantined && { ...account.quarantined, reason: oauth?.code === 'invalid_client' ? 'invalid_client' : 'refresh_uncertain' }
-          updated = terminal ? { ...clearAccount(account), quarantinedHistory: account.quarantinedHistory, revocationUnconfirmed: true } : { ...account, refreshPending: undefined, revocationUnconfirmed: true, quarantined: preserved }
+          updated = restore ? restore : terminal ? { ...clearAccount(account), quarantinedHistory: account.quarantinedHistory, revocationUnconfirmed: true } : { ...account, refreshPending: undefined, revocationUnconfirmed: true, quarantined: preserved }
         }
         return { ...current!, accounts: current!.accounts.map(a => a.clientId === clientId ? updated : a) }
       })

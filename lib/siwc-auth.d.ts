@@ -131,7 +131,9 @@ export declare class SiwcOAuthError extends Error {
     readonly reauthorizationRequired: boolean;
     /** True means the protected credentials are quarantined; automatic refresh must not be retried. */
     readonly uncertain: boolean;
-    constructor(status: number | undefined, code: string | undefined, operation: 'token' | 'authorization' | 'refresh', reauthorizationRequired?: boolean, uncertain?: boolean);
+    /** True proves the request never reached the issuer (offline resolution or connect failure). */
+    readonly undelivered: boolean;
+    constructor(status: number | undefined, code: string | undefined, operation: 'token' | 'authorization' | 'refresh', reauthorizationRequired?: boolean, uncertain?: boolean, undelivered?: boolean);
 }
 export declare function signedIn(a: SiwcAccount): boolean;
 export declare function hasUnfinishedRevocation(account: SiwcAccount): boolean;
