@@ -1,348 +1,175 @@
+/**
+ * `dsh-openai-oauth`: Sign in with ChatGPT for DeepSeek Harness.
+ *
+ * The plugin owns the OAuth conversation that obtains a ChatGPT-plan grant and
+ * keeps the harness credential reference that a normal provider route reads.
+ * Everything a request needs after sign-in — model catalog, session history,
+ * streaming, tool calls, images, retries, error classification — belongs to
+ * DeepSeek Harness and its `llm-pi-ai` adapter. The plugin registers no model
+ * adapter and no session machinery of its own.
+ *
+ * Wiring a profile therefore has two halves:
+ *
+ * 1. this plugin, which signs in and publishes `OPENAI_CHATGPT_ACCESS_TOKEN`;
+ * 2. an `llm-pi-ai` route named `openai` (the route name matters: the adapter
+ *    only recognizes Sign in with ChatGPT plan requests under that provider)
+ *    whose `apiKeyEnv` is that reference.
+ *
+ * The settings page can switch that route's `apiKeyEnv` between the plan token
+ * and the deployment's stored `OPENAI_API_KEY`, so one route serves either
+ * authentication and the API key stays available for billing-backed use.
+ *
+ * ```yaml
+ * - id: llm-pi-ai
+ *   config:
+ *     providers:
+ *       openai:
+ *         apiKeyEnv: OPENAI_CHATGPT_ACCESS_TOKEN
+ *         models:
+ *           - id: gpt-6.2-sol
+ *           - id: gpt-6.1-terra
+ * ```
+ *
+ * @module dsh-openai-oauth
+ */
+
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import {
-  CallId,
-  LlmAdapter,
-  LlmError,
-  ReasoningEffortId,
-} from '@deepseek-ai/dsh-llm'
+import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import type {
-  ContentBlock,
-  GenerateOptions,
-  LlmModelInfo,
-  LlmResolvedModelInfo,
-  StreamChunk,
-  ToolResultBlock,
-} from '@deepseek-ai/dsh-llm'
-import { AppServer, type ServerEvent } from './app-server.js'
-import { oauthRoute } from './oauth-http.js'
+  CredentialKey,
+  CredentialProvider,
+  CredentialRecord,
+  GrantRecord,
+} from '@deepseek-ai/dsh-credentials'
+import z from '@deepseek-ai/schemastery'
+import { AuthModeController } from './auth-mode.js'
+import { oauthRoute, type OAuthConnection } from './oauth-http.js'
+import { configEditorStore, type ConfigEditorLike } from './route-config.js'
+import { SiwcService } from './siwc-service.js'
+import { SIWC_AGENT_NAME, type SecretStore, type SiwcState } from './siwc-auth.js'
+import { TokenPublisher } from './token-publisher.js'
 
+/** The registered plugin name; it also scopes the private OAuth grant record. */
 export const name = 'llm-codex-app-server'
-export const inject = ['llm']
-const PROVIDER = 'openai-codex'
-const REPLAY_KIND = 'codex-app-server'
+export const inject = ['credentials']
 
-interface PendingToolCall {
-  requestId: string | number
-  callId: string
-  name: string
-  arguments: unknown
+/** One model an older profile may still declare for the retired adapter. */
+export interface ConfiguredModel {
+  id: string
+  name?: string
+  description?: string
+  contextWindow?: number
+  maxTokens?: number
+  input?: readonly ('text' | 'image')[]
+  reasoningEfforts?: readonly string[]
+  defaultReasoningEffort?: string
 }
 
-interface Session {
-  threadId: string
-  tools: string
-  pending: PendingToolCall[]
-  backlog: ServerEvent[]
-  turnId?: string
+/**
+ * Configuration accepted for profiles written against the adapter-era plugin.
+ * Both fields are inert now: models are chosen in Settings > Models, and the
+ * transport belongs to the harness provider route. Keeping the keys accepted
+ * lets an existing profile upgrade without a hand edit.
+ */
+export interface Config {
+  /** @deprecated Ignored; inference is served by the harness provider route. */
+  responsesTransport?: 'direct' | 'bridge'
+  /** @deprecated Ignored; select models in Settings > Models instead. */
+  models?: readonly ConfiguredModel[] | { get(): readonly ConfiguredModel[] }
 }
 
-function textOf(blocks: readonly ContentBlock[]): string {
-  return blocks.map(block => block.type === 'text'
-    ? block.text
-    : block.type === 'tool-result' ? textOf(block.content) : '').join('')
+export const Config = z.object({
+  responsesTransport: z.union(['direct', 'bridge']).default('direct'),
+  models: z.array(z.object({
+    id: z.string().required(),
+    name: z.string(),
+    description: z.string(),
+    contextWindow: z.number(),
+    maxTokens: z.number(),
+    input: z.array(z.union(['text', 'image'])).default(['text', 'image']),
+    reasoningEfforts: z.array(z.string()),
+    defaultReasoningEffort: z.string(),
+  })).default([]).volatile(),
+})
+
+function isSiwcState(value: unknown): value is SiwcState {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const state = value as Record<string, unknown>
+  return typeof state.hostId === 'string' && state.hostId.length > 0 && Array.isArray(state.accounts)
 }
 
-function newUserText(options: GenerateOptions): string {
-  const lastAssistant = options.messages.findLastIndex(message => message.role === 'assistant')
-  return options.messages.slice(lastAssistant + 1)
-    .filter(message => message.role === 'user')
-    .flatMap(message => message.content)
-    .filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('\n\n')
-}
-
-function toolResults(options: GenerateOptions): Map<string, ToolResultBlock> {
-  const results = new Map<string, ToolResultBlock>()
-  for (const message of options.messages) {
-    for (const block of message.content) {
-      if (block.type === 'tool-result') results.set(block.toolCallId, block)
+/**
+ * Adapt the harness credential seam to the auth module's store: one grant
+ * record owned by this plugin keeps the authorization out of configuration,
+ * and `modifyRecord` supplies the cross-process exclusion token refresh needs.
+ * @param credentials - the harness credential service.
+ * @param key - this plugin's record address.
+ * @returns the durable secret store used by the authentication module.
+ */
+export function credentialStore(credentials: CredentialProvider, key: CredentialKey): SecretStore {
+  const stateOf = (record: CredentialRecord | undefined): SiwcState | undefined => {
+    if (record === undefined) return undefined
+    if (record.kind !== 'grant' || !isSiwcState(record.payload)) {
+      throw new Error('Stored OpenAI authorization is unreadable or was written by another plugin. Sign in again in Settings > OpenAI OAuth.')
     }
+    return record.payload
   }
-  return results
-}
-
-function toolSpec(options: GenerateOptions): Record<string, unknown>[] {
-  return (options.tools ?? []).map(tool => ({
-    type: 'function',
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.parameters,
-  }))
-}
-
-function sessionKey(options: GenerateOptions): string {
-  return String(options.sessionId ?? options.messages[0]?.id ?? 'one-shot')
-}
-
-function eventThreadItem(event: ServerEvent): Record<string, unknown> | undefined {
-  const item = event.params.item
-  return item !== null && typeof item === 'object' ? item as Record<string, unknown> : undefined
-}
-
-export class CodexAppServerAdapter extends LlmAdapter {
-  private readonly server: AppServer
-  private readonly sessions = new Map<string, Session>()
-  private modelsCache?: Record<string, unknown>[]
-
-  constructor(server = new AppServer()) {
-    super()
-    this.server = server
-  }
-
-  override providerInfo(): { id: string; name: string } {
-    return { id: PROVIDER, name: 'OpenAI Codex (ChatGPT OAuth)' }
-  }
-
-  private async models(): Promise<Record<string, unknown>[]> {
-    if (this.modelsCache !== undefined) return this.modelsCache
-    const account = await this.server.account()
-    if (account === null || account.type !== 'chatgpt') {
-      throw new LlmError('Codex is not signed in. Run dsh-codex-login first.', 'MISSING_CREDENTIAL')
-    }
-    this.modelsCache = (await this.server.models()).filter(model => model.hidden !== true)
-    return this.modelsCache
-  }
-
-  override async listModels(): Promise<readonly LlmModelInfo[]> {
-    return (await this.models()).map(model => ({
-      provider: PROVIDER,
-      id: String(model.model ?? model.id),
-      name: String(model.displayName ?? model.model ?? model.id),
-      description: typeof model.description === 'string' ? model.description : undefined,
-      inputModalities: Array.isArray(model.inputModalities)
-        ? model.inputModalities.filter(value => value === 'text' || value === 'image')
-        : ['text'],
-    }))
-  }
-
-  override async resolveModel(provider: string, modelId: string): Promise<LlmResolvedModelInfo> {
-    const model = (await this.models()).find(entry => entry.model === modelId || entry.id === modelId)
-    if (model === undefined) throw new LlmError(`Codex has no available model "${modelId}"`, 'UNKNOWN_MODEL')
-    const efforts = Array.isArray(model.supportedReasoningEfforts)
-      ? model.supportedReasoningEfforts.map((entry) => {
-        const value = entry as Record<string, unknown>
-        const id = String(value.reasoningEffort)
-        return { id: ReasoningEffortId(id), name: id, description: String(value.description ?? '') }
+  return {
+    async read() {
+      return stateOf(await credentials.readRecord(key))
+    },
+    async modify(update) {
+      await credentials.modifyRecord(key, async current => {
+        const next = await update(stateOf(current))
+        if (next === undefined) return undefined
+        // The credential document is strict JSON: optional fields the auth
+        // module represents as `undefined` must become absent, not a rejected
+        // write. A round trip is also what a later read would see.
+        return { kind: 'grant', payload: JSON.parse(JSON.stringify(next)) } satisfies GrantRecord
       })
-      : []
-    return {
-      provider,
-      id: modelId,
-      name: String(model.displayName ?? modelId),
-      description: typeof model.description === 'string' ? model.description : undefined,
-      inputModalities: Array.isArray(model.inputModalities)
-        ? model.inputModalities.filter(value => value === 'text' || value === 'image')
-        : ['text'],
-      ...efforts.length === 0 ? {} : {
-        reasoning: {
-          efforts,
-          defaultEffort: ReasoningEffortId(String(model.defaultReasoningEffort)),
-        },
-      },
-    }
-  }
-
-  private async createSession(options: GenerateOptions): Promise<Session> {
-    const tools = JSON.stringify(toolSpec(options))
-    const system = [
-      options.system ?? '',
-      'You are the model inside DeepSeek Harness. Use only the supplied dynamic tools.',
-      'Never call built-in Codex tools. Call at most one dynamic tool at a time.',
-    ].filter(Boolean).join('\n\n')
-    const threadId = await this.server.startThread({
-      model: options.model,
-      cwd: process.cwd(),
-      approvalPolicy: 'never',
-      sandbox: 'read-only',
-      ephemeral: false,
-      baseInstructions: system,
-      dynamicTools: toolSpec(options),
-    })
-    return { threadId, tools, pending: [], backlog: [] }
-  }
-
-  private async session(options: GenerateOptions): Promise<Session> {
-    const key = sessionKey(options)
-    let session = this.sessions.get(key)
-    if (session === undefined) {
-      session = await this.createSession(options)
-      this.sessions.set(key, session)
-    }
-    if (session.tools !== JSON.stringify(toolSpec(options))) {
-      throw new LlmError('Codex tool schemas changed during an active Harness session', 'UNSUPPORTED_OPTION')
-    }
-    return session
-  }
-
-  private async resumeTools(session: Session, options: GenerateOptions): Promise<void> {
-    const results = toolResults(options)
-    for (const call of session.pending) {
-      const result = results.get(call.callId)
-      if (result === undefined) throw new LlmError(`Missing Harness result for Codex tool call "${call.callId}"`, 'INVALID_REQUEST')
-      this.server.respond(call.requestId, {
-        contentItems: [{ type: 'inputText', text: textOf(result.content) || '(no output)' }],
-        success: result.isError !== true,
-      })
-    }
-    session.pending = []
-  }
-
-  private async nextEvent(session: Session, signal?: AbortSignal): Promise<ServerEvent> {
-    return session.backlog.shift() ?? this.server.nextEvent(session.threadId, signal)
-  }
-
-  private async collectToolCalls(
-    session: Session,
-    first: ServerEvent,
-    signal?: AbortSignal,
-  ): Promise<PendingToolCall[]> {
-    const calls: PendingToolCall[] = []
-    const add = (event: ServerEvent): void => {
-      const { callId, tool, arguments: args } = event.params
-      if (event.requestId === undefined || typeof callId !== 'string' || typeof tool !== 'string') {
-        throw new LlmError('Malformed Codex dynamic tool request', 'PROTOCOL_ERROR')
-      }
-      calls.push({ requestId: event.requestId, callId, name: tool, arguments: args })
-    }
-    add(first)
-
-    // ponytail: app-server has no batch-end event for parallel dynamic calls;
-    // collect the synchronously emitted JSON-RPC burst, then fail closed if a
-    // later call appears after Harness has started executing this batch.
-    while (true) {
-      const settle = AbortSignal.timeout(25)
-      const combined = signal === undefined ? settle : AbortSignal.any([signal, settle])
-      try {
-        const event = await this.server.nextEvent(session.threadId, combined)
-        if (event.method === 'item/tool/call') add(event)
-        else session.backlog.push(event)
-      } catch (error) {
-        if (signal?.aborted) throw error
-        break
-      }
-    }
-    return calls
-  }
-
-  async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    if (options.stop !== undefined || options.temperature !== undefined || options.maxTokens !== undefined) {
-      throw new LlmError('Codex app-server does not expose stop, temperature, or maxTokens per turn', 'UNSUPPORTED_OPTION')
-    }
-    if (options.messages.some(message => message.content.some(block => block.type === 'image'))) {
-      throw new LlmError('Codex app-server image bridging is not implemented', 'UNSUPPORTED_CONTENT')
-    }
-
-    const session = await this.session(options)
-    if (session.pending.length > 0) {
-      await this.resumeTools(session, options)
-    } else {
-      session.turnId = await this.server.startTurn(session.threadId, {
-        model: options.model,
-        ...options.reasoningEffort === undefined ? {} : { effort: String(options.reasoningEffort) },
-        input: [{ type: 'text', text: newUserText(options) }],
-      })
-    }
-
-    let nextIndex = 0
-    const open = new Map<string, { index: number; type: 'text' | 'reasoning'; text: string }>()
-    try {
-      while (true) {
-        const event = await this.nextEvent(session, options.signal)
-        if (event.method === 'turn/started') {
-          const turn = event.params.turn as Record<string, unknown>
-          if (typeof turn.id === 'string') session.turnId = turn.id
-          continue
-        }
-        if (event.method === 'item/agentMessage/delta' || event.method === 'item/reasoning/summaryTextDelta') {
-          const id = String(event.params.itemId)
-          const type = event.method === 'item/agentMessage/delta' ? 'text' : 'reasoning'
-          let block = open.get(id)
-          if (block === undefined) {
-            block = { index: nextIndex++, type, text: '' }
-            open.set(id, block)
-            yield { type: 'block-start', index: block.index, blockType: type }
-          }
-          const delta = String(event.params.delta ?? '')
-          block.text += delta
-          yield type === 'text'
-            ? { type: 'text-delta', index: block.index, text: delta }
-            : { type: 'reasoning-delta', index: block.index, text: delta }
-          continue
-        }
-        if (event.method === 'item/completed') {
-          const item = eventThreadItem(event)
-          const id = typeof item?.id === 'string' ? item.id : ''
-          const block = open.get(id)
-          if (block !== undefined) {
-            open.delete(id)
-            yield {
-              type: 'block-end',
-              index: block.index,
-              block: block.type === 'text'
-                ? { type: 'text', text: block.text }
-                : { type: 'reasoning', text: block.text },
-            }
-          }
-          continue
-        }
-        if (event.method === 'item/tool/call') {
-          const calls = await this.collectToolCalls(session, event, options.signal)
-          session.pending = calls
-          for (const call of calls) {
-            const index = nextIndex++
-            const args = JSON.stringify(call.arguments ?? {})
-            const id = CallId(call.callId)
-            yield { type: 'block-start', index, blockType: 'tool-call' }
-            yield { type: 'tool-call-delta', index, id, name: call.name, argumentsDelta: args }
-            yield {
-              type: 'block-end', index,
-              block: { type: 'tool-call', id, name: call.name, arguments: args },
-            }
-          }
-          yield {
-            type: 'finish',
-            reason: { kind: 'tool-calls' },
-            replayState: { kind: REPLAY_KIND, version: 1, threadId: session.threadId },
-          }
-          return
-        }
-        if (event.method === 'error') {
-          const detail = event.params.error as Record<string, unknown> | undefined
-          throw new LlmError(String(detail?.message ?? 'Codex turn failed'), 'CODEX_ERROR')
-        }
-        if (event.method === 'turn/completed') {
-          const turn = event.params.turn as Record<string, unknown>
-          if (turn.status === 'failed') {
-            const error = turn.error as Record<string, unknown> | undefined
-            throw new LlmError(String(error?.message ?? 'Codex turn failed'), 'CODEX_ERROR')
-          }
-          yield {
-            type: 'finish',
-            reason: turn.status === 'interrupted'
-              ? { kind: 'aborted', failure: { message: 'Codex turn interrupted', code: 'ABORTED' } }
-              : { kind: 'stop' },
-            replayState: { kind: REPLAY_KIND, version: 1, threadId: session.threadId },
-          }
-          return
-        }
-      }
-    } catch (error) {
-      if (options.signal?.aborted && session.turnId !== undefined) {
-        await this.server.interrupt(session.threadId, session.turnId).catch(() => {})
-      }
-      throw error
-    }
+    },
   }
 }
 
 export function apply(ctx: Context): void {
-  const server = new AppServer()
-  ctx.llm.registerAdapter([PROVIDER], new CodexAppServerAdapter(server))
-  ctx.effect(() => () => server.close(), 'llm-codex-app-server.close')
-  ctx.inject(['webServer'], (webCtx) => {
-    webCtx.effect(() => webCtx.webServer.register(oauthRoute(server)), 'llm-codex-app-server.oauth-route')
+  const store = credentialStore(ctx.credentials, credentialKey(name, 'siwc'))
+  const service = new SiwcService(store, {
+    appName: SIWC_AGENT_NAME,
+    // This plugin no longer owns a turn, so account changes and catalog reads
+    // no longer have a provider-side turn gate to respect. The service still
+    // serializes its own login/logout operations through its queue.
+    withAccountChange: change => change(),
+    withAccountRead: read => read(),
+  })
+  const authMode = new AuthModeController({
+    store: configEditorStore(ctx.get('configEditor' as never) as ConfigEditorLike | undefined),
+    credentials: ctx.credentials,
+    service,
+    logger: ctx.logger,
+  })
+  const publisher = new TokenPublisher({
+    credentials: ctx.credentials,
+    service,
+    logger: ctx.logger,
+  })
+  ctx.effect(() => {
+    publisher.start()
+    return async () => {
+      publisher.stop()
+      await service.close()
+    }
+  }, 'llm-codex-app-server.tokens')
+  ctx.inject(['webServer', 'connection'], webCtx => {
+    const connection: OAuthConnection = webCtx.get('connection')
+    webCtx.effect(() => webCtx.webServer.register(oauthRoute(service, {
+      connection,
+      protocol: webCtx.webServer.protocol,
+      authMode,
+      // A sign-in, account switch, or sign-out must reach the provider route
+      // without waiting for the next publish tick.
+      afterMutation: () => { void publisher.refresh() },
+    })), 'llm-codex-app-server.oauth-route')
   })
 }
 

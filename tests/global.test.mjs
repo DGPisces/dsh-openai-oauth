@@ -1,14 +1,25 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 
 const { version } = JSON.parse(await readFile('package.json', 'utf8'))
 
-test('global installer targets standard and existing profiles', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-codex-global-'))
+async function fixtureDir(t, prefix) {
+  const root = await mkdtemp(join(tmpdir(), prefix))
+  t.after(async () => {
+    const resolved = await realpath(root)
+    assert.equal(dirname(resolved), await realpath(tmpdir()))
+    assert(basename(resolved).startsWith(prefix))
+    await rm(resolved, { recursive: true, force: true })
+  })
+  return root
+}
+
+test('global installer targets standard and existing profiles', async t => {
+  const root = await fixtureDir(t, 'dsh-codex-global-')
   const bin = join(root, 'bin')
   const log = join(root, 'npx.log')
   await mkdir(join(root, 'dsh', 'profiles', 'custom'), { recursive: true })
@@ -32,8 +43,8 @@ test('global installer targets standard and existing profiles', async () => {
   assert(calls.every(line => line.includes(` add dsh-openai-oauth@${version}`)))
 })
 
-test('global installer replaces the legacy package after adding the new package', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-codex-migrate-'))
+test('global installer replaces the legacy package after adding the new package', async t => {
+  const root = await fixtureDir(t, 'dsh-codex-migrate-')
   const bin = join(root, 'bin')
   const log = join(root, 'npx.log')
   await mkdir(join(root, 'dsh', 'profiles', 'custom'), { recursive: true })
@@ -57,8 +68,8 @@ test('global installer replaces the legacy package after adding the new package'
   assert(remove > add)
 })
 
-test('global uninstaller only targets profiles that contain the plugin', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-codex-uninstall-'))
+test('global uninstaller only targets profiles that contain the plugin', async t => {
+  const root = await fixtureDir(t, 'dsh-codex-uninstall-')
   const bin = join(root, 'bin')
   const log = join(root, 'npx.log')
   await mkdir(join(root, 'dsh', 'profiles', 'with-plugin'), { recursive: true })
